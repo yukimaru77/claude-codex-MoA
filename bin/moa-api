@@ -562,9 +562,14 @@ class FusionHandler(BaseHTTPRequestHandler):
         meta = proto.request_meta(body)
         is_background = (cfg["protocol"] == "anthropic" and
                          meta["req_model"] == cfg.get("background_model_alias"))
+        # Only the exact generation endpoint may be fanned out. Subpaths like
+        # /v1/messages/count_tokens (no max_tokens) must NEVER enter moa mode —
+        # fanning them out re-posts them to /v1/messages and 400s, which is the
+        # same class of bug that destabilized the transparent daily driver.
+        is_generation = self.path.split("?", 1)[0] == proto.path
         bump(cfg, "items_total")
 
-        if mode != "moa" or is_background or not cfg["_instances"]:
+        if mode != "moa" or is_background or not is_generation or not cfg["_instances"]:
             kind = "background" if is_background else "passthrough"
             bump(cfg, "items_background" if is_background else "items_passthrough")
             if cfg.get("transparent_passthrough") and not is_background:
@@ -663,6 +668,12 @@ class FusionHandler(BaseHTTPRequestHandler):
                            "synthesis_error_body": body_snip,
                            "total_ms": int((time.time() - t_start) * 1000)})
             log_event(cfg, record)
+            # Never fall back onto a stream we already started writing: the
+            # client would get a second message_start spliced after partial
+            # synthesis bytes (or after an emitted error event) = corrupt SSE.
+            # Fallback re-streaming is only safe if nothing was sent yet.
+            if stream and getattr(self, "_sse_body_sent", False):
+                return
             # Fallback: re-run the highest-priority surviving candidate model,
             # streaming its answer directly. One extra upstream call, but the
             # emitted wire format is correct by construction for any protocol.
@@ -823,15 +834,11 @@ class FusionHandler(BaseHTTPRequestHandler):
         try:
             resp = upstream_request(cfg, proto, body, model, True,
                                     cfg["synthesis_timeout_s"], trace)
-        except Exception as exc:
-            err = {"type": "error",
-                   "error": {"type": "api_error",
-                             "message": f"upstream stream failed: {type(exc).__name__}"}}
-            try:
-                self.wfile.write(b"event: error\ndata: " + json.dumps(err).encode() + b"\n\n")
-                self.wfile.flush()
-            except OSError:
-                pass
+        except Exception:
+            # Do NOT emit an error event here: on a pre-byte failure the caller
+            # may still fall back cleanly (nothing sent yet). Emitting an event
+            # would both corrupt that fallback and, once _sse_body_sent flips,
+            # suppress it. Just propagate; forward_sse owns the "bytes sent" flag.
             raise
         with resp:
             self.forward_sse(resp)
@@ -850,6 +857,7 @@ class FusionHandler(BaseHTTPRequestHandler):
                 except (ValueError, UnicodeDecodeError):
                     pass
             try:
+                self._sse_body_sent = True  # once true, no stream fallback
                 self.wfile.write(line)
                 if line == b"\n":
                     self.wfile.flush()
@@ -870,10 +878,21 @@ class Instance(socketserver.ThreadingMixIn, socketserver.TCPServer):
         super().__init__((cfg["listen_host"], cfg["listen_port"]), FusionHandler)
 
 
+_LOOPBACK = {"127.0.0.1", "::1", "localhost"}
+
+
 def main():
     instances = load_instances()
     if not instances:
         raise SystemExit(f"no instance configs found in {CONFIG_DIR}")
+    # accept_any_local_auth disables auth entirely; it is only safe on loopback.
+    # Refuse to start an unauthenticated instance bound to a routable address,
+    # which would be an open relay spending the user's upstream quota.
+    for cfg in instances:
+        if cfg.get("accept_any_local_auth") and cfg["listen_host"] not in _LOOPBACK:
+            raise SystemExit(
+                f"instance {cfg['name']}: accept_any_local_auth requires a loopback "
+                f"listen_host, got {cfg['listen_host']!r} (would be an open relay)")
     servers = []
     for cfg in instances:
         if not os.path.exists(cfg["mode_file"]):

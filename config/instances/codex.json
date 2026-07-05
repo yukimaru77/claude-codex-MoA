@@ -10,5 +10,10 @@
   "passthrough_model": "oauth-gpt-5.5",
   "transparent_passthrough": true,
   "accept_any_local_auth": true,
-  "direct_upstream": "https://chatgpt.com/backend-api/codex/responses"
+  "direct_upstream": "https://chatgpt.com/backend-api/codex/responses",
+  "models_command": [
+    "codex",
+    "debug",
+    "models"
+  ]
 }

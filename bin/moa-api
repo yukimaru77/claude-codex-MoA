@@ -77,6 +77,12 @@ DEFAULT_INSTANCE = {
     # responses: https://chatgpt.com/backend-api/codex/responses
     "transparent_passthrough": False,
     "direct_upstream": "https://api.anthropic.com/v1/messages",
+    # Optional: a command whose stdout IS the /v1/models response body, served
+    # verbatim. Codex wants a proprietary {"models":[{slug,context_window,...}]}
+    # catalog that a generic OpenAI list can't satisfy; setting this to
+    # ["codex","debug","models"] serves Codex its own real catalog (captured at
+    # boot; refreshes on daemon restart). Empty = synthesize the list ourselves.
+    "models_command": [],
 }
 
 SYNTH_INSTRUCTION = (
@@ -118,6 +124,17 @@ def load_instances():
                 expanded.append({"model": model,
                                  "instance": f"{model}#{per_model[model]}"})
         cfg["_instances"] = expanded
+        # Capture the models_command output once at boot (see config comment).
+        cfg["_models_body"] = None
+        if cfg.get("models_command"):
+            try:
+                import subprocess
+                out = subprocess.run(cfg["models_command"], capture_output=True,
+                                     timeout=30, check=True).stdout
+                json.loads(out)  # validate it is JSON before caching
+                cfg["_models_body"] = out
+            except Exception:
+                cfg["_models_body"] = None
         cfg["_lock"] = threading.Lock()
         cfg["_counters"] = {
             "items_total": 0, "items_moa": 0, "items_passthrough": 0,
@@ -480,9 +497,34 @@ class FusionHandler(BaseHTTPRequestHandler):
         elif self.path == "/control":
             self._json(200, {"mode": current_mode(self.cfg)})
         elif self.path.startswith("/v1/models"):
+            # If a models_command was captured at boot, serve it verbatim (Codex
+            # needs its own proprietary catalog shape).
+            if self.cfg.get("_models_body"):
+                body = self.cfg["_models_body"]
+                self.send_response(200)
+                self.send_header("content-type", "application/json")
+                self.send_header("content-length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            # Otherwise advertise our own model(s) PLUS the upstream gateway's
+            # real catalog, so clients that refresh their model list get the set.
             models = [{"id": self.cfg["advertised_model"], "object": "model"}]
             if self.cfg["protocol"] == "anthropic":
                 models.append({"id": self.cfg["background_model_alias"], "object": "model"})
+            seen = {m["id"] for m in models}
+            try:
+                req = urllib.request.Request(
+                    self.cfg["upstream"] + "/v1/models",
+                    headers={"authorization": "Bearer " + upstream_key(self.cfg)})
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    for m in json.loads(resp.read()).get("data", []):
+                        mid = m.get("id")
+                        if mid and mid not in seen:
+                            seen.add(mid)
+                            models.append(m)
+            except Exception:
+                pass  # upstream catalog is a nice-to-have; never fail the list
             self._json(200, {"data": models, "object": "list"})
         else:
             self._error(404, "not found")

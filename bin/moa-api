@@ -667,8 +667,23 @@ class FusionHandler(BaseHTTPRequestHandler):
             if k.lower() not in self.HOP_HEADERS:
                 headers[k] = v
         data = json.dumps(body, ensure_ascii=False).encode()
-        req = urllib.request.Request(cfg["direct_upstream"],
-                                     data=data, headers=headers)
+        # Preserve the client's ACTUAL path. Claude Code hits more than one
+        # endpoint under /v1/messages (notably /v1/messages/count_tokens, which
+        # carries no max_tokens); forcing everything onto direct_upstream's path
+        # made count_tokens 400 with "max_tokens: Field required" and destabilized
+        # sessions. For anthropic, splice the client path onto the upstream host;
+        # for responses the client path (/v1/responses) maps to a fixed backend
+        # path, so use direct_upstream verbatim.
+        if self.proto is AnthropicProto:
+            import urllib.parse as _u
+            p = _u.urlsplit(cfg["direct_upstream"])
+            target = _u.urlunsplit((p.scheme, p.netloc, self.path.split("?")[0], "", ""))
+            if "?" in self.path:
+                target += "?" + self.path.split("?", 1)[1]
+        else:
+            target = cfg["direct_upstream"]
+        record["direct_path"] = self.path
+        req = urllib.request.Request(target, data=data, headers=headers)
         try:
             resp = urllib.request.urlopen(req, timeout=cfg["synthesis_timeout_s"])
         except urllib.error.HTTPError as exc:

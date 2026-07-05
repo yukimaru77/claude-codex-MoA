@@ -74,3 +74,4 @@ jq 'select(.mode=="moa") | {ts, total_ms, degraded}' ~/.local/share/moa/obs/moa-
 | client shows "Failed to parse JSON" in passthrough | compressed upstream body relayed raw | should not happen: accept-encoding is stripped in direct forwards — if seen, daemon predates that fix |
 | everything slow in moa mode | wall clock = slowest candidate + synthesis | `moa stats` shows the slow candidate; remove it or lower `candidate_timeout_s` |
 | session ignores /moa | session started before the proxy wiring | restart the CLI (base URL is fixed at process start) |
+| passthrough 400 "max_tokens: Field required" (model = your own, no max_tokens) | a non-`/v1/messages` endpoint (e.g. `/v1/messages/count_tokens`) was force-routed to `/v1/messages` | fixed: proxy_direct preserves the client's actual path (`direct_path` in telemetry). If seen, the daemon predates the fix — restart it |

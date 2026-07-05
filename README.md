@@ -5,16 +5,22 @@ Item-level **MoA (Mixture of Agents)** proxy for Claude Code and Codex CLI.
 Every single step of an agent loop (one API call = one "item") can be
 answered by a committee: the identical request fans out to N candidate
 models in parallel, then a synthesizer model merges their proposals into
-the one response the client receives. Toggle per session with `/moa` —
-in "passthrough" mode the proxy is **byte-transparent** (your own login,
-your own models, claude.ai connectors intact), so it is safe to keep your
-daily-driver `claude` / `codex` permanently routed through it.
+the one response the client receives.
+
+Entry commands: **`claude-moa`** and **`codex-moa`**. They share your NORMAL
+environment — same settings, skills, MCP servers, sessions, and login as
+plain `claude`/`codex` (no isolated config dirs, no injected tokens); the
+only difference is the wire hop through the local proxy. Plain `claude` and
+`codex` are never touched and stay fully direct.
 
 ```
-claude ──▶ :8400 (anthropic protocol) ─┬─ passthrough → api.anthropic.com (your auth, verbatim)
-codex  ──▶ :8401 (responses protocol) ─┤
-                                       └─ moa → candidates via gateway → synthesizer → one item
+claude-moa ──▶ :8400 (anthropic protocol) ─┬─ passthrough → api.anthropic.com (your auth, verbatim)
+codex-moa  ──▶ :8401 (responses protocol) ─┤
+                                           └─ moa → candidates via gateway → synthesizer → one item
 ```
+
+Toggle per session with `/moa`: passthrough is **byte-transparent**
+(verified indistinguishable from a direct session, connectors included).
 
 ## Upstream gateway
 
@@ -33,18 +39,13 @@ cd ~/tasks/claude-codex-MoA && ./install.sh
 moa diag all        # must be all PASS
 ```
 
-Then (user decision — one line each) route the daily drivers through it:
-- Claude: `"ANTHROPIC_BASE_URL": "http://127.0.0.1:8400"` in the `env` of `~/.claude/settings.json`
-- Codex: `model_provider = "moa"` + a `[model_providers.moa]` table
-  (`base_url = "http://127.0.0.1:8401/v1"`, `wire_api = "responses"`,
-  `requires_openai_auth = true`) in `~/.codex/config.toml`
-
-Rollback = remove those lines. AI agents: follow `docs/AGENT_SETUP.md`.
+Then start a MoA-capable session with `claude-moa` or `codex-moa` and hit
+`/moa` whenever you want the committee. AI agents: follow `docs/AGENT_SETUP.md`.
 
 ## Use
 
 ```
-/moa            # in Claude Code or Codex: toggle for the current session (next step)
+/moa            # inside a claude-moa / codex-moa session: toggle from the next step
 moa on codex    # same from a terminal
 moa status      # live counters per instance
 moa stats 24    # aggregates: per-candidate ok/fail + latency percentiles

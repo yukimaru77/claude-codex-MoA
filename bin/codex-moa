@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# codex-moa — Codex CLI through the MoA proxy (:8401), sharing your NORMAL
+# environment: same ~/.codex config, skills, MCP servers, and ChatGPT login
+# (requires_openai_auth forwards your own OAuth; the proxy is byte-transparent
+# in passthrough mode). /moa (or `moa on codex`) toggles fusion per step.
+set -euo pipefail
+
+MOA_URL="http://127.0.0.1:8401"
+REAL_CODEX="${REAL_CODEX:-$(command -v codex || echo /opt/homebrew/bin/codex)}"
+if [ -f "$HOME/.local/share/ai-harness/lib/obs.sh" ]; then
+  . "$HOME/.config/ai-harness/paths.env" 2>/dev/null || true
+  . "$HOME/.local/share/ai-harness/lib/obs.sh"
+  OBS_WRAPPER_VERSION=1
+  obs_init codex-moa "$@"
+  obs_curl_probe moa_api_codex "$MOA_URL/health" || {
+    obs_event fatal reason=moa_api_unreachable url="$MOA_URL"
+    echo "moa-api is not running. Run: moa diag codex" >&2
+    exit 69
+  }
+  obs_event route_resolved base_url="$MOA_URL" mode="$(cat "$HOME/.local/share/moa/mode-codex" 2>/dev/null || echo passthrough)" real_bin="$REAL_CODEX"
+  RUN() { obs_run "$@"; }
+else
+  curl -fsS -m 5 "$MOA_URL/health" >/dev/null || {
+    echo "moa-api is not running. Run: moa diag codex" >&2
+    exit 69
+  }
+  RUN() { exec "$@"; }
+fi
+
+# Provider is injected per-invocation; ~/.codex/config.toml stays untouched,
+# so plain `codex` remains fully direct.
+RUN "$REAL_CODEX" \
+  -c "model_providers.moa={ name = 'MoA', base_url = '$MOA_URL/v1', wire_api = 'responses', requires_openai_auth = true }" \
+  -c 'model_provider="moa"' \
+  "$@"

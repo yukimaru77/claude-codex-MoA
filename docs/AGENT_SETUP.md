@@ -42,34 +42,25 @@ using the printed fix commands (docs/OBSERVABILITY.md has the runbook).
 - Candidate counts: `{"model": "...", "count": 2}` runs two independent
   samples. Any change = edit JSON + `launchctl kickstart -k gui/$(id -u)/com.<user>.moa`.
 
-## Phase 4 — route the daily drivers (ASK THE USER first)
+## Phase 4 — entry commands (default; do NOT touch plain claude/codex)
 
-This makes the MoA daemon a dependency of the user's everyday CLIs.
-Explain that, get explicit consent, then:
-
-- Claude: add to the `env` object of `~/.claude/settings.json`:
-  `"ANTHROPIC_BASE_URL": "http://127.0.0.1:8400"`
-- Codex: in `~/.codex/config.toml` (back it up first): set root-level
-  `model_provider = "moa"` and append:
-
-      [model_providers.moa]
-      name = "MoA"
-      base_url = "http://127.0.0.1:8401/v1"
-      wire_api = "responses"
-      requires_openai_auth = true
-
-Rollback = revert those lines. Sessions started before the change keep
-talking directly until restarted.
+install.sh links `claude-moa` and `codex-moa` into `~/.local/bin`. They are
+transparent wrappers: no config-dir isolation, no injected tokens, no model
+pins — the user's normal skills, MCP servers, sessions, and login are shared
+verbatim; only ANTHROPIC_BASE_URL (claude) or an inline `-c` model_provider
+(codex) points at the proxy. NEVER modify ~/.claude/settings.json or
+~/.codex/config.toml to route the plain commands — that was tried and the
+user reverted it (2026-07-06): the daily drivers must stay direct.
 
 ## Phase 5 — end-to-end verification
 
 ```bash
-claude --print "Reply with exactly: MOA-PT" # passthrough, must answer normally
+claude-moa --print "Reply with exactly: MOA-PT" # passthrough, must answer normally
 moa on claude
-claude --print "Reply with exactly: MOA-ON" # fans out; check:
-moa stats 1                                  # candidates all ok, no degraded
+claude-moa --print "Reply with exactly: MOA-ON" # fans out; check:
+moa stats 1                                     # candidates all ok, no degraded
 moa off claude
-# same pattern for codex: codex exec --skip-git-repo-check --ephemeral '...'
+# same for codex: codex-moa exec --skip-git-repo-check --ephemeral '...'
 ```
 
 Confirm `moa stats` shows the item with all candidates ok and the

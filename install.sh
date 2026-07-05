@@ -13,9 +13,9 @@
 #   ~/.codex/prompts/moa.md          /moa for Codex
 #   ~/.agents/skills/moa             natural-language discovery for Codex
 #
-# It does NOT edit ~/.claude/settings.json or ~/.codex/config.toml for you:
-# routing the daily drivers through the proxy is a user decision. See
-# docs/AGENT_SETUP.md Phase 4 for the two one-line changes.
+#   ~/.local/bin/claude-moa, codex-moa   MoA-capable entry commands (they
+#                                         share your normal skills/MCP/login)
+# It never touches plain `claude` / `codex` — those stay fully direct.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")" && pwd)"
@@ -28,7 +28,7 @@ CHECK=0
 say() { printf '%s\n' "$*"; }
 run() { if [ "$CHECK" = 1 ]; then printf '[check]'; printf ' %q' "$@"; printf '\n'; else "$@"; fi; }
 
-for f in bin/moa-api bin/moa config/instances/claude.json config/instances/codex.json \
+for f in bin/moa-api bin/moa bin/claude-moa bin/codex-moa config/instances/claude.json config/instances/codex.json \
          config/claude-command-moa.md config/codex-prompt-moa.md config/skill-moa/SKILL.md \
          service/com.USER.moa.plist; do
   [ -e "$REPO/$f" ] || { echo "missing repo file: $f" >&2; exit 66; }
@@ -41,6 +41,8 @@ for inst in claude codex; do
     run cp "$REPO/config/instances/$inst.json" "$HOME/.config/moa/instances/$inst.json"
 done
 run ln -sfn "$REPO/bin/moa" "$HOME/.local/bin/moa"
+run ln -sfn "$REPO/bin/claude-moa" "$HOME/.local/bin/claude-moa"
+run ln -sfn "$REPO/bin/codex-moa" "$HOME/.local/bin/codex-moa"
 run cp "$REPO/config/claude-command-moa.md" "$HOME/.claude/commands/moa.md"
 run cp "$REPO/config/codex-prompt-moa.md" "$HOME/.codex/prompts/moa.md"
 run mkdir -p "$HOME/.agents/skills/moa"

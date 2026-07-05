@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# claude-moa — Claude Code through the MoA proxy (:8400), sharing your NORMAL
+# environment: same ~/.claude settings, skills, MCP servers, sessions, and
+# claude.ai login (no AUTH_TOKEN injected; the proxy forwards your own OAuth).
+# Starts in whatever mode `moa status` shows (usually passthrough =
+# byte-transparent). /moa toggles fusion from the next step.
+set -euo pipefail
+
+MOA_URL="http://127.0.0.1:8400"
+REAL_CLAUDE="${REAL_CLAUDE:-$(command -v claude || echo /opt/homebrew/bin/claude)}"
+# optional telemetry (CrossProviderAgentSetting's obs library, if installed)
+if [ -f "$HOME/.local/share/ai-harness/lib/obs.sh" ]; then
+  . "$HOME/.config/ai-harness/paths.env" 2>/dev/null || true
+  . "$HOME/.local/share/ai-harness/lib/obs.sh"
+  REAL_CLAUDE="${REAL_CLAUDE:-claude}"
+  OBS_WRAPPER_VERSION=1
+  obs_init claude-moa "$@"
+  obs_curl_probe moa_api "$MOA_URL/health" || {
+    obs_event fatal reason=moa_api_unreachable url="$MOA_URL"
+    echo "moa-api is not running. Run: moa diag claude" >&2
+    exit 69
+  }
+  obs_event route_resolved base_url="$MOA_URL" mode="$(cat "$HOME/.local/share/moa/mode-claude" 2>/dev/null || echo passthrough)" real_bin="$REAL_CLAUDE"
+  RUN() { obs_run "$@"; }
+else
+  curl -fsS -m 5 "$MOA_URL/health" >/dev/null || {
+    echo "moa-api is not running. Run: moa diag claude" >&2
+    exit 69
+  }
+  RUN() { exec "$@"; }
+fi
+
+export ANTHROPIC_BASE_URL="$MOA_URL"
+# Everything else stays YOURS: no CLAUDE_CONFIG_DIR override, no settings
+# file, no model pin — skills, MCP, sessions, and models are identical to
+# plain `claude`; only the wire hop differs.
+RUN "$REAL_CLAUDE" "$@"

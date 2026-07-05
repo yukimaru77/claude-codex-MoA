@@ -1,6 +1,6 @@
 ---
 name: moa
-description: Toggle MoA (Mixture of Agents) fusion for Claude/Codex sessions. Use when the user says "moa", "MoA", "mixture of agents", "fusion mode", or asks to turn multi-model fusion on/off or check its status.
+description: Toggle MoA (Mixture of Agents) fusion for claude-moa / codex-moa sessions. Use when the user says "moa", "MoA", "mixture of agents", "fusion mode", or asks to turn multi-model fusion on/off or check its status.
 ---
 
 # moa — Mixture of Agents toggle
@@ -11,14 +11,15 @@ models in parallel and a synthesizer merges them) and "passthrough"
 
 Run with the shell tool (argument: on / off / toggle / status; default toggle):
 
-    moa <arg> claude    # in Claude Code
-    moa <arg> codex     # in Codex
+    moa <arg> claude    # for claude-moa sessions
+    moa <arg> codex     # for codex-moa sessions
 
-All Claude and Codex sessions run through the MoA proxies by default
-(claude: ANTHROPIC_BASE_URL in ~/.claude/settings.json; codex: the `moa`
-model provider in ~/.codex/config.toml), so the new mode applies from the
-next step. Only sessions started BEFORE that wiring existed need a restart —
-for Claude verify with `echo "${ANTHROPIC_BASE_URL:-direct}"` (8400 = proxied).
+The mode only takes effect in sessions started via `claude-moa` / `codex-moa`
+(they share the user's normal skills, MCP, sessions, and login — only the
+wire hop differs). Plain `claude` / `codex` sessions are direct and cannot be
+rerouted mid-flight; tell the user to start the -moa command instead.
+For Claude you can check with `echo "${ANTHROPIC_BASE_URL:-direct}"`
+(8400 = proxied session).
 
-Report in 1-2 lines: the new mode and that it applies from the next step.
+Report in 1-2 lines: the new mode and where it applies.
 Diagnosis if anything misbehaves: `moa diag all`.

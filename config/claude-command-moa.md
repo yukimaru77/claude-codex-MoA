@@ -1,5 +1,5 @@
 ---
-description: Toggle MoA (Mixture of Agents) for Claude sessions (all sessions run through the MoA proxy)
+description: Toggle MoA (Mixture of Agents) — takes effect in claude-moa sessions
 allowed-tools: Bash(moa:*), Bash(echo:*)
 ---
 
@@ -12,9 +12,10 @@ Then report to the user in 1-2 short lines:
 - If command 2 printed a URL containing `8400`: this session runs through the
   MoA proxy, so the new mode applies **from the very next step**. State the
   mode: "moa" = every step fans out to the candidate models and the
-  synthesizer merges them; "passthrough" = fully transparent single-model
-  behavior (requests go byte-faithfully to api.anthropic.com with your own
-  login).
-- Otherwise: this session was started before the proxy setting existed — the
-  global mode was still switched; tell the user to restart `claude` so the
-  session picks up the proxy.
+  synthesizer merges them; "passthrough" = byte-transparent single-model
+  behavior (your own login and models).
+- Otherwise: this session talks directly to its provider and cannot be
+  rerouted mid-flight. The global mode was still switched — tell the user to
+  run `claude-moa` in a terminal for a session where it takes effect
+  (claude-moa shares the same skills, MCP, sessions, and login as plain
+  claude; only the wire hop differs).

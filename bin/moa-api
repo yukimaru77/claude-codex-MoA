@@ -1,0 +1,849 @@
+#!/usr/bin/env python3
+"""moa-api — multi-instance MoA (Mixture of Agents) proxy.
+
+Serves one fusion proxy PER CONFIG FILE in ~/.config/moa/instances/*.json
+(override dir with MOA_CONFIG_DIR). Adding another proxy later = drop
+a new JSON there and restart the LaunchAgent; no code changes.
+
+Each instance speaks one client protocol:
+  "protocol": "anthropic"  — Anthropic Messages API (/v1/messages); used by
+                             Claude Code (instance "claude")
+  "protocol": "responses"  — OpenAI Responses API (/v1/responses); used by
+                             Codex CLI (instance "codex")
+
+In "moa" mode every request fans out to the configured candidate model
+instances in parallel (via the upstream CLIProxyAPI, which converts protocols
+per model), then a synthesizer model merges the proposals into the single
+response the client receives. "passthrough" = single model, no fan-out.
+
+Instance config keys (defaults in DEFAULT_INSTANCE):
+  listen_port, protocol, candidates (string or {"model":..,"count":N}),
+  synthesizer, passthrough_model, background_model(+alias, anthropic only),
+  advertised_model, candidate_timeout_s, synthesis_timeout_s, keepalive_s,
+  strip_thinking_from_candidates, mode_file, log_file
+
+Telemetry: one JSONL file per instance (obs/moa-<name>.jsonl, schema 2 —
+documented in OBSERVABILITY.md). /health per instance exposes live counters.
+Diagnosis: `moa diag [instance]`.
+"""
+import concurrent.futures
+import glob
+import json
+import os
+import socketserver
+import threading
+import time
+import urllib.error
+import urllib.request
+import uuid
+from http.server import BaseHTTPRequestHandler
+
+HOME = os.path.expanduser("~")
+CONFIG_DIR = os.environ.get(
+    "MOA_CONFIG_DIR",
+    os.path.join(HOME, ".config", "moa", "instances"))
+
+DEFAULT_INSTANCE = {
+    "listen_host": "127.0.0.1",
+    "protocol": "anthropic",
+    "upstream": "http://127.0.0.1:8317",
+    "upstream_key_file": "~/.config/ai-harness/secrets/cliproxy-client.key",
+    "advertised_model": "moa-v1",
+    "background_model_alias": "moa-bg",
+    "candidates": [],
+    "candidate_timeout_s": 240,
+    "synthesis_timeout_s": 600,
+    "keepalive_s": 10,
+    "strip_thinking_from_candidates": True,
+    # Claude Code >=2.1.201 inserts mid-conversation role:"system" messages,
+    # which older Anthropic models (e.g. opus-4-7) reject with 400
+    # "role 'system' is not supported on this model". When enabled (anthropic
+    # protocol only), such messages are converted to user messages wrapped in
+    # <system-message> tags before forwarding upstream.
+    "coerce_system_messages": True,
+    # Accept ANY client Authorization header (or none) instead of requiring
+    # the cliproxy client key. Safe only because the daemon binds 127.0.0.1.
+    # Used by the claude instance so Claude Code can keep its native claude.ai OAuth
+    # login (which preserves claude.ai connectors); the proxy swaps in its
+    # own upstream key regardless of what the client sent.
+    "accept_any_local_auth": False,
+    # Transparent passthrough (anthropic protocol only): when NOT in moa mode,
+    # forward the request byte-faithfully to direct_upstream with the CLIENT's
+    # own auth and headers — no model swap, no coercion, no cliproxy. Makes a
+    # proxied daily-driver session behaviorally identical to a direct one;
+    # only moa mode routes through the fan-out machinery.
+    # direct_upstream is the FULL upstream URL (protocol-specific), e.g.
+    # anthropic: https://api.anthropic.com/v1/messages
+    # responses: https://chatgpt.com/backend-api/codex/responses
+    "transparent_passthrough": False,
+    "direct_upstream": "https://api.anthropic.com/v1/messages",
+}
+
+SYNTH_INSTRUCTION = (
+    "You are the final synthesizer in an item-level multi-model fusion system. "
+    "For the CURRENT conversation state, {n} independent models each proposed "
+    "the next assistant message. Their proposals follow as JSON:\n\n{candidates}\n\n"
+    "Weigh them (they may agree, disagree, or be partially right), then produce "
+    "the single best next assistant message YOURSELF: call the most appropriate "
+    "tool/function with the best arguments, or reply in natural language — "
+    "whatever this state requires. Never mention the candidates, the other "
+    "models, or this synthesis step in your output."
+)
+
+START_TIME = time.time()
+BOOT_ID = uuid.uuid4().hex[:12]
+
+
+def load_instances():
+    instances = []
+    for path in sorted(glob.glob(os.path.join(CONFIG_DIR, "*.json"))):
+        name = os.path.splitext(os.path.basename(path))[0]
+        cfg = dict(DEFAULT_INSTANCE)
+        with open(path, "r", encoding="utf-8") as f:
+            cfg.update(json.load(f))
+        cfg["name"] = name
+        cfg.setdefault("mode_file", f"~/.local/share/moa/mode-{name}")
+        cfg.setdefault("log_file", f"~/.local/share/moa/obs/moa-{name}.jsonl")
+        cfg.setdefault("log_max_bytes", 50 * 1024 * 1024)
+        for k in ("upstream_key_file", "mode_file", "log_file"):
+            cfg[k] = os.path.expanduser(cfg[k])
+        expanded, per_model = [], {}
+        for entry in cfg["candidates"]:
+            if isinstance(entry, str):
+                model, count = entry, 1
+            else:
+                model, count = entry["model"], int(entry.get("count", 1))
+            for _ in range(count):
+                per_model[model] = per_model.get(model, 0) + 1
+                expanded.append({"model": model,
+                                 "instance": f"{model}#{per_model[model]}"})
+        cfg["_instances"] = expanded
+        cfg["_lock"] = threading.Lock()
+        cfg["_counters"] = {
+            "items_total": 0, "items_moa": 0, "items_passthrough": 0,
+            "items_background": 0, "items_degraded": 0, "client_errors": 0,
+            "candidate_ok": {}, "candidate_fail": {},
+        }
+        instances.append(cfg)
+    return instances
+
+
+def bump(cfg, key, sub=None):
+    with cfg["_lock"]:
+        c = cfg["_counters"]
+        if sub is None:
+            c[key] = c.get(key, 0) + 1
+        else:
+            d = c.setdefault(key, {})
+            d[sub] = d.get(sub, 0) + 1
+
+
+def log_event(cfg, record):
+    record.setdefault("schema", 2)
+    record.setdefault("ts", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
+    record.setdefault("ts_ms", int(time.time() * 1000))
+    record.setdefault("boot_id", BOOT_ID)
+    record.setdefault("instance_name", cfg["name"])
+    try:
+        os.makedirs(os.path.dirname(cfg["log_file"]), exist_ok=True)
+        with cfg["_lock"]:
+            try:
+                if os.path.getsize(cfg["log_file"]) > cfg["log_max_bytes"]:
+                    os.replace(cfg["log_file"], cfg["log_file"] + ".1")
+            except OSError:
+                pass
+            with open(cfg["log_file"], "a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+
+
+def upstream_key(cfg):
+    with open(cfg["upstream_key_file"], "r", encoding="utf-8") as f:
+        return f.read().strip()
+
+
+def current_mode(cfg):
+    try:
+        with open(cfg["mode_file"], "r", encoding="utf-8") as f:
+            mode = f.read().strip()
+        return mode if mode in ("moa", "passthrough") else "passthrough"
+    except OSError:
+        return "passthrough"
+
+
+def set_mode(cfg, mode):
+    os.makedirs(os.path.dirname(cfg["mode_file"]), exist_ok=True)
+    with open(cfg["mode_file"], "w", encoding="utf-8") as f:
+        f.write(mode + "\n")
+
+
+# ---------------------------------------------------------------------------
+# Protocol adapters: everything protocol-specific lives here.
+# ---------------------------------------------------------------------------
+class AnthropicProto:
+    path = "/v1/messages"
+
+    @staticmethod
+    def sanitize_body(body):
+        msgs = body.get("messages")
+        if not isinstance(msgs, list) or not any(
+                isinstance(m, dict) and m.get("role") == "system" for m in msgs):
+            return body
+        out = dict(body)
+        new_msgs = []
+        for m in msgs:
+            if isinstance(m, dict) and m.get("role") == "system":
+                content = m.get("content")
+                if isinstance(content, str):
+                    text = content
+                else:
+                    text = "\n".join(b.get("text", "") for b in (content or [])
+                                      if isinstance(b, dict) and b.get("type") == "text")
+                new_msgs.append({"role": "user", "content": [
+                    {"type": "text",
+                     "text": "<system-message>\n" + text + "\n</system-message>"}]})
+            else:
+                new_msgs.append(m)
+        out["messages"] = new_msgs
+        return out
+
+    @staticmethod
+    def request_meta(body):
+        msgs = body.get("messages", [])
+        last_role = msgs[-1].get("role") if msgs else None
+        has_tool_result = False
+        if msgs and isinstance(msgs[-1].get("content"), list):
+            has_tool_result = any(isinstance(b, dict) and b.get("type") == "tool_result"
+                                  for b in msgs[-1]["content"])
+        return {"req_model": body.get("model"), "n_messages": len(msgs),
+                "n_tools": len(body.get("tools", []) or []),
+                "max_tokens": body.get("max_tokens"),
+                "input_chars": len(json.dumps(msgs, ensure_ascii=False)) if msgs else 0,
+                "last_role": last_role, "last_has_tool_result": has_tool_result}
+
+    @staticmethod
+    def extract_output(data, strip):
+        content = data.get("content", [])
+        if strip and isinstance(content, list):
+            content = [b for b in content if not (isinstance(b, dict) and
+                       b.get("type") in ("thinking", "redacted_thinking"))]
+        return content, data.get("stop_reason"), data.get("usage")
+
+    @staticmethod
+    def summarize(output):
+        if not isinstance(output, list):
+            return {"blocks": 0}
+        types, text_chars, tool_names = {}, 0, []
+        for b in output:
+            if not isinstance(b, dict):
+                continue
+            t = b.get("type", "?")
+            types[t] = types.get(t, 0) + 1
+            if t == "text":
+                text_chars += len(b.get("text", ""))
+            elif t == "tool_use":
+                tool_names.append(b.get("name"))
+        return {"blocks": len(output), "types": types,
+                "text_chars": text_chars, "tools_called": tool_names}
+
+    @staticmethod
+    def build_synthesis_body(body, survivors, instruction):
+        synth = dict(body)
+        system = synth.get("system")
+        if system is None:
+            system = []
+        elif isinstance(system, str):
+            system = [{"type": "text", "text": system}]
+        else:
+            system = list(system)
+        system.append({"type": "text", "text": instruction})
+        synth["system"] = system
+        return synth
+
+    @staticmethod
+    def rewrite_model_json(obj, advertised):
+        if "model" in obj:
+            obj["model"] = advertised
+        return obj
+
+    @staticmethod
+    def rewrite_model_sse(obj, advertised):
+        msg = obj.get("message")
+        if isinstance(msg, dict) and "model" in msg:
+            msg["model"] = advertised
+            return True
+        return False
+
+
+class ResponsesProto:
+    path = "/v1/responses"
+
+    @staticmethod
+    def sanitize_body(body):
+        return body
+
+    @staticmethod
+    def request_meta(body):
+        inp = body.get("input")
+        n_items = len(inp) if isinstance(inp, list) else (1 if inp else 0)
+        last_type = None
+        if isinstance(inp, list) and inp:
+            last = inp[-1]
+            last_type = last.get("type") if isinstance(last, dict) else "text"
+        return {"req_model": body.get("model"), "n_messages": n_items,
+                "n_tools": len(body.get("tools", []) or []),
+                "max_tokens": body.get("max_output_tokens"),
+                "input_chars": len(json.dumps(inp, ensure_ascii=False)) if inp else 0,
+                "last_role": last_type,
+                "last_has_tool_result": last_type == "function_call_output"}
+
+    @staticmethod
+    def extract_output(data, strip):
+        output = data.get("output", [])
+        if strip and isinstance(output, list):
+            output = [it for it in output if not (isinstance(it, dict) and
+                      it.get("type") == "reasoning")]
+        return output, data.get("status"), data.get("usage")
+
+    @staticmethod
+    def summarize(output):
+        if not isinstance(output, list):
+            return {"blocks": 0}
+        types, text_chars, tool_names = {}, 0, []
+        for it in output:
+            if not isinstance(it, dict):
+                continue
+            t = it.get("type", "?")
+            types[t] = types.get(t, 0) + 1
+            if t == "message":
+                for c in it.get("content", []) or []:
+                    if isinstance(c, dict) and c.get("type") == "output_text":
+                        text_chars += len(c.get("text", ""))
+            elif t == "function_call":
+                tool_names.append(it.get("name"))
+        return {"blocks": len(output), "types": types,
+                "text_chars": text_chars, "tools_called": tool_names}
+
+    @staticmethod
+    def build_synthesis_body(body, survivors, instruction):
+        synth = dict(body)
+        inp = synth.get("input")
+        if isinstance(inp, str):
+            items = [{"type": "message", "role": "user",
+                      "content": [{"type": "input_text", "text": inp}]}]
+        else:
+            items = list(inp or [])
+        items.append({"type": "message", "role": "user",
+                      "content": [{"type": "input_text", "text": instruction}]})
+        synth["input"] = items
+        return synth
+
+    @staticmethod
+    def rewrite_model_json(obj, advertised):
+        if "model" in obj:
+            obj["model"] = advertised
+        return obj
+
+    @staticmethod
+    def rewrite_model_sse(obj, advertised):
+        resp = obj.get("response")
+        changed = False
+        if isinstance(resp, dict) and "model" in resp:
+            resp["model"] = advertised
+            changed = True
+        if "model" in obj:
+            obj["model"] = advertised
+            changed = True
+        return changed
+
+
+PROTOCOLS = {"anthropic": AnthropicProto, "responses": ResponsesProto}
+
+
+def upstream_request(cfg, proto, body, model, stream, timeout, trace):
+    if cfg.get("coerce_system_messages") and proto is AnthropicProto:
+        body = proto.sanitize_body(body)
+    payload = dict(body)
+    payload["model"] = model
+    payload["stream"] = stream
+    data = json.dumps(payload).encode()
+    headers = {
+        "authorization": "Bearer " + upstream_key(cfg),
+        "content-type": "application/json",
+        "x-ai-harness-trace": trace,
+    }
+    if proto is AnthropicProto:
+        headers["anthropic-version"] = "2023-06-01"
+    req = urllib.request.Request(cfg["upstream"] + proto.path, data=data, headers=headers)
+    return urllib.request.urlopen(req, timeout=timeout)
+
+
+def run_candidate(cfg, proto, body, inst, trace):
+    model, label = inst["model"], inst["instance"]
+    t0 = time.time()
+    try:
+        with upstream_request(cfg, proto, body, model, False,
+                              cfg["candidate_timeout_s"], trace) as resp:
+            data = json.loads(resp.read())
+        output, stop, usage = proto.extract_output(data, cfg["strip_thinking_from_candidates"])
+        bump(cfg, "candidate_ok", label)
+        return {"instance": label, "model": model, "ok": True,
+                "latency_ms": int((time.time() - t0) * 1000),
+                "stop_reason": stop, "usage": usage,
+                "summary": proto.summarize(output), "content": output}
+    except Exception as exc:  # noqa: BLE001 — candidate failure is data
+        status, detail = None, ""
+        if isinstance(exc, urllib.error.HTTPError):
+            status = exc.code
+            try:
+                detail = exc.read()[:400].decode("utf-8", "replace")
+            except Exception:
+                pass
+        bump(cfg, "candidate_fail", label)
+        return {"instance": label, "model": model, "ok": False,
+                "latency_ms": int((time.time() - t0) * 1000),
+                "http_status": status,
+                "error": f"{type(exc).__name__}: {exc}"[:300],
+                "error_body": detail}
+
+
+class FusionHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    server_version = "moa-api/1"
+
+    def log_message(self, fmt, *args):
+        pass
+
+    @property
+    def cfg(self):
+        return self.server.cfg
+
+    @property
+    def proto(self):
+        return PROTOCOLS[self.cfg["protocol"]]
+
+    # ---- plumbing --------------------------------------------------------
+    def _json(self, code, obj):
+        data = json.dumps(obj, ensure_ascii=False).encode()
+        self.send_response(code)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _error(self, code, message, req_id=None):
+        bump(self.cfg, "client_errors")
+        log_event(self.cfg, {"event": "client_error", "req_id": req_id,
+                             "http_status": code, "message": message,
+                             "path": self.path})
+        self._json(code, {"type": "error",
+                          "error": {"type": "api_error", "message": message}})
+
+    def _start_sse(self):
+        self.send_response(200)
+        self.send_header("content-type", "text/event-stream")
+        self.send_header("cache-control", "no-cache")
+        self.send_header("connection", "close")
+        self.end_headers()
+        self.close_connection = True
+
+    def _authorized(self):
+        if self.cfg.get("accept_any_local_auth"):
+            return True
+        auth = self.headers.get("authorization", "") or self.headers.get("x-api-key", "")
+        token = auth.replace("Bearer ", "").strip()
+        try:
+            return token == upstream_key(self.cfg)
+        except OSError:
+            return False
+
+    # ---- routes ----------------------------------------------------------
+    def do_GET(self):
+        if self.path == "/health":
+            with self.cfg["_lock"]:
+                counters = json.loads(json.dumps(self.cfg["_counters"]))
+            self._json(200, {
+                "status": "ok", "instance": self.cfg["name"],
+                "protocol": self.cfg["protocol"], "boot_id": BOOT_ID,
+                "uptime_s": int(time.time() - START_TIME),
+                "mode": current_mode(self.cfg),
+                "candidates": [i["instance"] for i in self.cfg["_instances"]],
+                "synthesizer": self.cfg.get("synthesizer"),
+                "passthrough_model": self.cfg.get("passthrough_model"),
+                "background_model": self.cfg.get("background_model"),
+                "upstream": self.cfg["upstream"],
+                "mode_file": self.cfg["mode_file"],
+                "log_file": self.cfg["log_file"],
+                "counters": counters,
+            })
+        elif self.path == "/control":
+            self._json(200, {"mode": current_mode(self.cfg)})
+        elif self.path.startswith("/v1/models"):
+            models = [{"id": self.cfg["advertised_model"], "object": "model"}]
+            if self.cfg["protocol"] == "anthropic":
+                models.append({"id": self.cfg["background_model_alias"], "object": "model"})
+            self._json(200, {"data": models, "object": "list"})
+        else:
+            self._error(404, "not found")
+
+    def do_POST(self):
+        length = int(self.headers.get("content-length") or 0)
+        raw = self.rfile.read(length) if length else b"{}"
+        if self.path == "/control":
+            try:
+                mode = json.loads(raw).get("mode")
+            except json.JSONDecodeError:
+                mode = None
+            if mode not in ("moa", "passthrough"):
+                return self._error(400, "mode must be 'moa' or 'passthrough'")
+            set_mode(self.cfg, mode)
+            log_event(self.cfg, {"event": "mode_change", "mode": mode})
+            return self._json(200, {"mode": mode})
+        if self.proto.path.lstrip("/").split("/")[-1] in self.path:
+            req_id = uuid.uuid4().hex[:12]
+            if not self._authorized():
+                return self._error(401, "invalid fusion-api key", req_id)
+            try:
+                body = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                return self._error(400, f"invalid JSON body: {exc}", req_id)
+            return self.handle_item(body, req_id)
+        return self._error(404, f"not found (this instance serves {self.proto.path})")
+
+    # ---- core ------------------------------------------------------------
+    def handle_item(self, body, req_id):
+        cfg, proto = self.cfg, self.proto
+        trace = self.headers.get("x-ai-harness-trace") or str(uuid.uuid4())
+        stream = bool(body.get("stream"))
+        mode = current_mode(cfg)
+        meta = proto.request_meta(body)
+        is_background = (cfg["protocol"] == "anthropic" and
+                         meta["req_model"] == cfg.get("background_model_alias"))
+        bump(cfg, "items_total")
+
+        if mode != "moa" or is_background or not cfg["_instances"]:
+            kind = "background" if is_background else "passthrough"
+            bump(cfg, "items_background" if is_background else "items_passthrough")
+            if cfg.get("transparent_passthrough") and not is_background:
+                return self.proxy_direct(body, stream, trace, req_id, meta, kind)
+            target = cfg.get("background_model") if is_background else cfg.get("passthrough_model")
+            return self.proxy_single(body, target, stream, trace, req_id, meta, kind)
+
+        bump(cfg, "items_moa")
+        t_start = time.time()
+        if stream:
+            self._start_sse()
+
+        candidates = []
+        instances = cfg["_instances"]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(instances)) as pool:
+            futures = [pool.submit(run_candidate, cfg, proto, body, inst, trace)
+                       for inst in instances]
+            pending = set(futures)
+            while pending:
+                done, pending = concurrent.futures.wait(
+                    pending, timeout=cfg["keepalive_s"],
+                    return_when=concurrent.futures.ALL_COMPLETED)
+                candidates.extend(f.result() for f in done)
+                if pending and stream:
+                    try:
+                        self.wfile.write(b": moa fan-out in progress\n\n")
+                        self.wfile.flush()
+                    except OSError:
+                        log_event(cfg, {"event": "moa_item", "req_id": req_id,
+                                        "trace_id": trace, "mode": "moa",
+                                        "request": meta,
+                                        "aborted": "client_disconnected_during_fanout",
+                                        "fanout_ms": int((time.time() - t_start) * 1000)})
+                        for f in pending:
+                            f.cancel()
+                        return
+
+        fanout_ms = int((time.time() - t_start) * 1000)
+        survivors = [c for c in candidates if c.get("ok")]
+        record = {
+            "event": "moa_item", "req_id": req_id, "trace_id": trace,
+            "mode": "moa", "stream": stream, "request": meta,
+            "fanout_ms": fanout_ms,
+            "candidates": [{k: c.get(k) for k in
+                            ("instance", "model", "ok", "latency_ms", "stop_reason",
+                             "http_status", "error", "summary", "usage")
+                            if c.get(k) is not None}
+                           for c in candidates],
+            "n_survivors": len(survivors),
+        }
+
+        if not survivors:
+            bump(cfg, "items_degraded")
+            record["degraded"] = "all_candidates_failed"
+            log_event(cfg, record)
+            if stream:
+                return self.stream_upstream_after_headers(body, cfg["synthesizer"], trace)
+            return self.proxy_single(body, cfg["synthesizer"], stream, trace,
+                                     req_id, meta, "degraded")
+
+        cand_json = json.dumps(
+            [{"model": c["instance"], "stop_reason": c.get("stop_reason"),
+              "content": c["content"]} for c in survivors], ensure_ascii=False)
+        instruction = SYNTH_INSTRUCTION.format(n=len(survivors), candidates=cand_json)
+        synth_body = proto.build_synthesis_body(body, survivors, instruction)
+        record["synthesis_input_chars"] = len(instruction)
+        t_syn = time.time()
+        try:
+            if stream:
+                self.stream_upstream_after_headers(synth_body, cfg["synthesizer"], trace)
+            else:
+                with upstream_request(cfg, proto, synth_body, cfg["synthesizer"],
+                                      False, cfg["synthesis_timeout_s"], trace) as resp:
+                    data = json.loads(resp.read())
+                proto.rewrite_model_json(data, cfg["advertised_model"])
+                output, _, _ = proto.extract_output(data, False)
+                record["synthesis_summary"] = proto.summarize(output)
+                self._json(200, data)
+            record.update({"synthesizer": cfg["synthesizer"],
+                           "synthesis_ms": int((time.time() - t_syn) * 1000),
+                           "total_ms": int((time.time() - t_start) * 1000)})
+            log_event(cfg, record)
+        except Exception as exc:
+            status = exc.code if isinstance(exc, urllib.error.HTTPError) else None
+            body_snip = ""
+            if isinstance(exc, urllib.error.HTTPError):
+                try:
+                    body_snip = exc.read()[:400].decode("utf-8", "replace")
+                except Exception:
+                    pass
+            bump(cfg, "items_degraded")
+            record.update({"degraded": "synthesis_failed",
+                           "synthesizer": cfg["synthesizer"],
+                           "synthesis_http_status": status,
+                           "synthesis_error": f"{type(exc).__name__}: {exc}"[:300],
+                           "synthesis_error_body": body_snip,
+                           "total_ms": int((time.time() - t_start) * 1000)})
+            log_event(cfg, record)
+            # Fallback: re-run the highest-priority surviving candidate model,
+            # streaming its answer directly. One extra upstream call, but the
+            # emitted wire format is correct by construction for any protocol.
+            best_model = None
+            for inst in cfg["_instances"]:
+                if any(c["instance"] == inst["instance"] for c in survivors):
+                    best_model = inst["model"]
+                    break
+            try:
+                if stream:
+                    self.stream_upstream_after_headers(body, best_model, trace)
+                else:
+                    with upstream_request(cfg, proto, body, best_model, False,
+                                          cfg["synthesis_timeout_s"], trace) as resp:
+                        data = json.loads(resp.read())
+                    proto.rewrite_model_json(data, cfg["advertised_model"])
+                    self._json(200, data)
+                log_event(cfg, {"event": "moa_fallback_served", "req_id": req_id,
+                                "trace_id": trace, "model": best_model})
+            except Exception as exc2:
+                log_event(cfg, {"event": "moa_fallback_failed", "req_id": req_id,
+                                "trace_id": trace, "model": best_model,
+                                "error": f"{type(exc2).__name__}: {exc2}"[:300]})
+                if not stream:
+                    self._error(502, "fusion synthesis and fallback both failed", req_id)
+
+    # accept-encoding is stripped too: urllib does not decompress, so a
+    # compressed upstream body would be relayed as opaque bytes the client
+    # cannot parse. Forcing identity keeps the relay byte-transparent.
+    HOP_HEADERS = {"host", "content-length", "connection", "keep-alive",
+                   "transfer-encoding", "upgrade", "proxy-authorization", "te",
+                   "accept-encoding"}
+
+    def proxy_direct(self, body, stream, trace, req_id, meta, kind):
+        """Byte-faithful forward to the real Anthropic API with the client's
+        own headers/auth. Used for non-moa traffic of transparent instances."""
+        cfg = self.cfg
+        t0 = time.time()
+        record = {"event": "moa_item", "req_id": req_id, "trace_id": trace,
+                  "mode": kind, "direct": True, "stream": stream,
+                  "model": body.get("model"), "request": meta}
+        headers = {}
+        for k, v in self.headers.items():
+            if k.lower() not in self.HOP_HEADERS:
+                headers[k] = v
+        data = json.dumps(body, ensure_ascii=False).encode()
+        req = urllib.request.Request(cfg["direct_upstream"],
+                                     data=data, headers=headers)
+        try:
+            resp = urllib.request.urlopen(req, timeout=cfg["synthesis_timeout_s"])
+        except urllib.error.HTTPError as exc:
+            payload = exc.read()
+            self.send_response(exc.code)
+            self.send_header("content-type", exc.headers.get("content-type", "application/json"))
+            self.send_header("content-length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            record.update({"http_status": exc.code,
+                           "error_body": payload[:400].decode("utf-8", "replace"),
+                           "total_ms": int((time.time() - t0) * 1000)})
+            log_event(cfg, record)
+            return
+        except Exception as exc:
+            record.update({"error": f"{type(exc).__name__}: {exc}"[:300],
+                           "total_ms": int((time.time() - t0) * 1000)})
+            log_event(cfg, record)
+            return self._error(502, f"direct upstream unreachable: {type(exc).__name__}", req_id)
+        with resp:
+            if stream:
+                self._start_sse()
+                # no model rewrite: the client asked for this model by name
+                for line in resp:
+                    try:
+                        self.wfile.write(line)
+                        if line == b"\n":
+                            self.wfile.flush()
+                    except OSError:
+                        break
+                try:
+                    self.wfile.flush()
+                except OSError:
+                    pass
+            else:
+                payload = resp.read()
+                self.send_response(200)
+                self.send_header("content-type", "application/json")
+                self.send_header("content-length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+        record["total_ms"] = int((time.time() - t0) * 1000)
+        log_event(cfg, record)
+
+    def proxy_single(self, body, model, stream, trace, req_id, meta, kind):
+        cfg, proto = self.cfg, self.proto
+        t0 = time.time()
+        record = {"event": "moa_item", "req_id": req_id, "trace_id": trace,
+                  "mode": kind, "stream": stream, "model": model, "request": meta}
+        try:
+            resp = upstream_request(cfg, proto, body, model, stream,
+                                    cfg["synthesis_timeout_s"], trace)
+        except urllib.error.HTTPError as exc:
+            payload = exc.read()
+            self.send_response(exc.code)
+            self.send_header("content-type", exc.headers.get("content-type", "application/json"))
+            self.send_header("content-length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            record.update({"http_status": exc.code,
+                           "error_body": payload[:400].decode("utf-8", "replace"),
+                           "total_ms": int((time.time() - t0) * 1000)})
+            log_event(cfg, record)
+            return
+        except Exception as exc:
+            record.update({"error": f"{type(exc).__name__}: {exc}"[:300],
+                           "total_ms": int((time.time() - t0) * 1000)})
+            log_event(cfg, record)
+            return self._error(502, f"upstream unreachable: {type(exc).__name__}", req_id)
+        with resp:
+            if stream:
+                self._start_sse()
+                self.forward_sse(resp)
+            else:
+                data = resp.read()
+                try:
+                    parsed = json.loads(data)
+                    proto.rewrite_model_json(parsed, cfg["advertised_model"])
+                    output, _, usage_ = proto.extract_output(parsed, False)
+                    record["response_summary"] = proto.summarize(output)
+                    record["usage"] = parsed.get("usage")
+                    data = json.dumps(parsed, ensure_ascii=False).encode()
+                except (ValueError, KeyError):
+                    pass
+                self.send_response(200)
+                self.send_header("content-type", "application/json")
+                self.send_header("content-length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+        record["total_ms"] = int((time.time() - t0) * 1000)
+        log_event(cfg, record)
+
+    def stream_upstream_after_headers(self, body, model, trace):
+        cfg, proto = self.cfg, self.proto
+        try:
+            resp = upstream_request(cfg, proto, body, model, True,
+                                    cfg["synthesis_timeout_s"], trace)
+        except Exception as exc:
+            err = {"type": "error",
+                   "error": {"type": "api_error",
+                             "message": f"upstream stream failed: {type(exc).__name__}"}}
+            try:
+                self.wfile.write(b"event: error\ndata: " + json.dumps(err).encode() + b"\n\n")
+                self.wfile.flush()
+            except OSError:
+                pass
+            raise
+        with resp:
+            self.forward_sse(resp)
+
+    def forward_sse(self, resp):
+        cfg, proto = self.cfg, self.proto
+        adv = cfg["advertised_model"]
+        for line in resp:
+            if b'"model"' in line:
+                try:
+                    txt = line.decode("utf-8")
+                    if txt.startswith("data: "):
+                        obj = json.loads(txt[6:])
+                        if proto.rewrite_model_sse(obj, adv):
+                            line = b"data: " + json.dumps(obj, ensure_ascii=False).encode() + b"\n"
+                except (ValueError, UnicodeDecodeError):
+                    pass
+            try:
+                self.wfile.write(line)
+                if line == b"\n":
+                    self.wfile.flush()
+            except OSError:
+                return
+        try:
+            self.wfile.flush()
+        except OSError:
+            pass
+
+
+class Instance(socketserver.ThreadingMixIn, socketserver.TCPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+        super().__init__((cfg["listen_host"], cfg["listen_port"]), FusionHandler)
+
+
+def main():
+    instances = load_instances()
+    if not instances:
+        raise SystemExit(f"no instance configs found in {CONFIG_DIR}")
+    servers = []
+    for cfg in instances:
+        if not os.path.exists(cfg["mode_file"]):
+            set_mode(cfg, "passthrough")
+        log_event(cfg, {"event": "boot",
+                        "listen": f"{cfg['listen_host']}:{cfg['listen_port']}",
+                        "protocol": cfg["protocol"],
+                        "config_dir": CONFIG_DIR,
+                        "candidates": [i["instance"] for i in cfg["_instances"]],
+                        "synthesizer": cfg.get("synthesizer"),
+                        "passthrough_model": cfg.get("passthrough_model"),
+                        "background_model": cfg.get("background_model"),
+                        "mode": current_mode(cfg)})
+        srv = Instance(cfg)
+        servers.append(srv)
+        threading.Thread(target=srv.serve_forever, daemon=True,
+                         name=f"moa-{cfg['name']}").start()
+    try:
+        while True:
+            time.sleep(3600)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        for srv in servers:
+            log_event(srv.cfg, {"event": "shutdown"})
+            srv.shutdown()
+
+
+if __name__ == "__main__":
+    main()

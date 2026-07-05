@@ -1,0 +1,14 @@
+{
+  "listen_port": 8401,
+  "protocol": "responses",
+  "advertised_model": "moa-v1",
+  "candidates": [
+    "oauth-gpt-5.5",
+    "zai/glm-5.2"
+  ],
+  "synthesizer": "oauth-gpt-5.5",
+  "passthrough_model": "oauth-gpt-5.5",
+  "transparent_passthrough": true,
+  "accept_any_local_auth": true,
+  "direct_upstream": "https://chatgpt.com/backend-api/codex/responses"
+}

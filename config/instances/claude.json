@@ -1,0 +1,17 @@
+{
+  "listen_port": 8400,
+  "protocol": "anthropic",
+  "advertised_model": "moa-v1",
+  "background_model_alias": "moa-bg",
+  "candidates": [
+    "claude-opus-4-7",
+    "oauth-gpt-5.5",
+    "zai/glm-5.2"
+  ],
+  "synthesizer": "claude-fable-5",
+  "passthrough_model": "claude-opus-4-7",
+  "background_model": "claude-sonnet-5",
+  "transparent_passthrough": true,
+  "accept_any_local_auth": true,
+  "direct_upstream": "https://api.anthropic.com/v1/messages"
+}

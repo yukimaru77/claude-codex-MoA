@@ -1,0 +1,274 @@
+#!/usr/bin/env bash
+# moa — control and diagnose the MoA (Mixture of Agents) proxies.
+# One instance per config file in ~/.config/moa/instances/*.json
+# (claude :8400 anthropic, codex :8401 responses; add more freely).
+#
+#   moa status [inst]           mode + daemon health (default: all)
+#   moa on|off|toggle [inst]    switch mode (default: claude)
+#   moa logs [N] [inst]         tail telemetry (default 20, instance claude)
+#   moa errors [N] [inst]       degraded/error items, newest first
+#   moa stats [hours]           aggregate: items, per-candidate ok/latency
+#   moa diag [inst|all]         layer-by-layer PASS/FAIL self-check with the
+#                               exact fix per failure. Run FIRST when broken.
+set -uo pipefail
+
+CONF_DIR="$HOME/.config/moa/instances"
+STATE_DIR="$HOME/.local/share/moa"
+LABEL="com.$(id -un).moa"
+launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1 || LABEL="com.nonaka.moa"
+
+instances() { ls "$CONF_DIR"/*.json 2>/dev/null | xargs -n1 basename 2>/dev/null | sed 's/\.json$//'; }
+
+cfg_get() { # cfg_get <instance> <key> [default]
+  python3 - "$CONF_DIR/$1.json" "$2" "${3:-}" <<'PY'
+import json, sys
+try:
+    v = json.load(open(sys.argv[1])).get(sys.argv[2])
+except Exception:
+    v = None
+print(v if v is not None else sys.argv[3])
+PY
+}
+
+inst_port() { cfg_get "$1" listen_port 8400; }
+inst_key_file() {
+  local f
+  f="$(cfg_get "$1" upstream_key_file "$HOME/.config/ai-harness/secrets/cliproxy-client.key")"
+  printf '%s\n' "${f/#\~/$HOME}"
+}
+inst_mode_file() {
+  local f
+  f="$(cfg_get "$1" mode_file "")"
+  [ -n "$f" ] && printf '%s\n' "${f/#\~/$HOME}" || printf '%s\n' "$STATE_DIR/mode-$1"
+}
+inst_log() {
+  local f
+  f="$(cfg_get "$1" log_file "")"
+  [ -n "$f" ] && printf '%s\n' "${f/#\~/$HOME}" || printf '%s\n' "$STATE_DIR/obs/moa-$1.jsonl"
+}
+inst_mode() { cat "$(inst_mode_file "$1")" 2>/dev/null || echo passthrough; }
+
+set_mode() { # set_mode <instance> <mode>
+  local mf
+  mf="$(inst_mode_file "$1")"
+  mkdir -p "$(dirname "$mf")"
+  printf '%s\n' "$2" > "$mf"
+  echo "moa[$1] mode: $2"
+}
+
+pass() { printf 'PASS  %s\n' "$1"; }
+fail() { FAILED=1; printf 'FAIL  %s\n      fix: %s\n' "$1" "$2"; }
+
+diag_one() {
+  local inst="$1" port url m health key
+  port="$(inst_port "$inst")"
+  url="http://127.0.0.1:$port"
+  echo "== instance $inst (:$port, protocol $(cfg_get "$inst" protocol anthropic))"
+
+  if python3 -c "import json;json.load(open('$CONF_DIR/$inst.json'))" 2>/dev/null; then
+    pass "config $CONF_DIR/$inst.json is valid JSON"
+  else
+    fail "config $CONF_DIR/$inst.json missing or invalid JSON" \
+         "restore from the claude-codex-MoA repo: config/instances/$inst.json"
+  fi
+
+  m="$(inst_mode "$inst")"
+  case "$m" in
+    moa|passthrough) pass "mode file readable (mode=$m)" ;;
+    *) fail "mode file has unexpected value '$m'" "echo passthrough > $(inst_mode_file "$inst")" ;;
+  esac
+
+  if launchctl print "gui/$(id -u)/$LABEL" 2>/dev/null | grep -q 'state = running'; then
+    pass "LaunchAgent $LABEL running"
+  else
+    fail "LaunchAgent $LABEL not running" \
+         "launchctl bootstrap gui/\$(id -u) ~/Library/LaunchAgents/$LABEL.plist; check $STATE_DIR/launchd.err.log"
+  fi
+
+  health="$(curl -fsS -m 5 "$url/health" 2>/dev/null || true)"
+  if [ -n "$health" ]; then
+    pass "daemon answering on $url"
+  else
+    fail "daemon not answering on $url" \
+         "launchctl kickstart -k gui/\$(id -u)/$LABEL; tail $STATE_DIR/launchd.err.log (port clash? another instance on :$port?)"
+  fi
+
+  key="$(cat "$(inst_key_file "$inst")" 2>/dev/null || true)"
+  local upstream
+  upstream="$(cfg_get "$inst" upstream http://127.0.0.1:8317)"
+  if [ -z "$key" ]; then
+    fail "upstream key $(inst_key_file "$inst") unreadable" \
+         "install CrossProviderAgentSetting (provider hub) or point upstream_key_file at a valid gateway key"
+  elif curl -fsS -m 5 -H "Authorization: Bearer $key" "$upstream/v1/models" >/dev/null 2>&1; then
+    pass "upstream gateway $upstream reachable + authorized"
+  else
+    fail "upstream gateway $upstream unreachable" \
+         "if using CrossProviderAgentSetting: launchctl kickstart -k gui/\$(id -u)/com.$(id -un).ai-harness.cliproxy (or com.nonaka...); then ai-auth status"
+  fi
+
+  if [ -n "$key" ]; then
+    for m in $(python3 -c "
+import json
+d=json.load(open('$CONF_DIR/$inst.json'))
+models=set()
+for c in d.get('candidates',[]):
+    models.add(c if isinstance(c,str) else c['model'])
+for k in ('synthesizer','passthrough_model','background_model'):
+    if d.get(k): models.add(d[k])
+print(' '.join(sorted(models)))" 2>/dev/null); do
+      out="$(curl -sS -m 90 -X POST "$upstream/v1/messages" \
+        -H "Authorization: Bearer $key" -H "content-type: application/json" \
+        -d "{\"model\":\"$m\",\"max_tokens\":8,\"messages\":[{\"role\":\"user\",\"content\":\"ok\"}]}" 2>/dev/null)"
+      if printf '%s' "$out" | grep -qE '"type": ?"message"'; then
+        pass "model $m answers"
+      else
+        errtype="$(printf '%s' "$out" | python3 -c "import json,sys
+try: print(json.load(sys.stdin).get('error',{}).get('type','no-response'))
+except Exception: print('no-response')" 2>/dev/null)"
+        case "$errtype" in
+          rate_limit_error) hint="429 from provider. If ONLY claude models fail: set disable-claude-cloak-mode: false in the gateway (cliproxy) config and restart it. Otherwise wait / check plan quota." ;;
+          authentication_error) hint="credential missing/expired in the gateway: ai-auth status; ai-auth login anthropic / login openai; GLM: ai-auth rotate zai" ;;
+          *) hint="raw body via: moa errors 20 $inst; gateway error dumps under ~/.local/share/ai-harness/cliproxy/logs/" ;;
+        esac
+        fail "model $m failed ($errtype)" "$hint"
+      fi
+    done
+  fi
+
+  if [ -n "$key" ] && [ -n "$health" ]; then
+    local proto ep payload okpat adv transparent
+    transparent="$(cfg_get "$inst" transparent_passthrough False)"
+    proto="$(cfg_get "$inst" protocol anthropic)"
+    adv="$(cfg_get "$inst" advertised_model moa-v1)"
+    if [ "$proto" = "responses" ]; then
+      ep="$url/v1/responses"
+      payload="{\"model\":\"$adv\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"ok\"}]}],\"max_output_tokens\":16,\"stream\":false}"
+      okpat='"object": ?"response"|"type": ?"message"'
+    else
+      ep="$url/v1/messages"
+      payload="{\"model\":\"$adv\",\"max_tokens\":8,\"messages\":[{\"role\":\"user\",\"content\":\"ok\"}]}"
+      okpat='"type": ?"message"'
+    fi
+    if [ "$transparent" = "True" ] || [ "$transparent" = "true" ]; then
+      # Transparent passthrough forwards the CLIENT's own credentials, which
+      # this probe does not have — a synthetic E2E request would always 401.
+      # Instead verify the direct upstream is reachable (any HTTP status <500
+      # proves DNS/TCP/TLS/server; auth comes from the real client).
+      local direct code
+      direct="$(cfg_get "$inst" direct_upstream "")"
+      code="$(curl -sS -m 10 -o /dev/null -w '%{http_code}' -X POST "$direct" \
+        -H "content-type: application/json" -d '{}' 2>/dev/null || echo 0)"
+      if [ "${code:-0}" -ge 100 ] && [ "${code:-0}" -lt 500 ]; then
+        pass "direct upstream $direct reachable (HTTP $code; real clients bring their own auth)"
+      else
+        fail "direct upstream $direct unreachable (HTTP ${code:-0})" \
+             "network/provider outage on the passthrough path — see the runbook"
+      fi
+    else
+      out="$(curl -sS -m 120 -X POST "$ep" -H "Authorization: Bearer $key" \
+        -H "content-type: application/json" -d "$payload" 2>/dev/null)"
+      if printf '%s' "$out" | grep -qE "$okpat"; then
+        pass "end-to-end request through $inst"
+      else
+        fail "end-to-end request through $inst failed" \
+             "moa errors 20 $inst  # newest line names the failing phase and upstream body"
+      fi
+    fi
+  fi
+
+  local log recent
+  log="$(inst_log "$inst")"
+  if [ -f "$log" ]; then
+    recent="$(tail -n 200 "$log" | grep -c '"degraded"' || true)"
+    if [ "${recent:-0}" -gt 0 ]; then
+      echo "NOTE  $recent degraded item(s) in the last 200 log lines — moa errors 20 $inst"
+    else
+      pass "no degraded items in the last 200 log lines"
+    fi
+  fi
+  echo
+}
+
+diag() {
+  FAILED=0
+  echo "MoA self-diagnosis ($(date -u '+%Y-%m-%dT%H:%M:%SZ'))"
+  echo "docs: docs/OBSERVABILITY.md in the claude-codex-MoA repo"
+  echo
+  local target="${1:-all}" i
+  if [ "$target" = "all" ]; then
+    for i in $(instances); do diag_one "$i"; done
+  else
+    diag_one "$target"
+  fi
+  if [ "${FAILED:-0}" = "0" ]; then
+    echo "RESULT: all checks passed."
+  else
+    echo "RESULT: at least one FAIL — apply fixes top to bottom (earlier layers cause later failures)."
+  fi
+  [ "${FAILED:-0}" = "0" ]
+}
+
+stats() {
+  python3 - "${1:-24}" "$STATE_DIR/obs" <<'PY'
+import glob, json, os, sys, time
+hours, obs = float(sys.argv[1]), sys.argv[2]
+cut = time.time() * 1000 - hours * 3600 * 1000
+def pct(v, p):
+    if not v: return 0
+    v = sorted(v); return v[min(len(v)-1, round(p/100*(len(v)-1)))]
+items, cand, synth, tot = [], {}, [], []
+modes, degraded = {}, {}
+for fp in sorted(glob.glob(os.path.join(obs, "moa-*.jsonl*"))):
+    for line in open(fp, errors="replace"):
+        try: d = json.loads(line)
+        except ValueError: continue
+        if d.get("event") != "moa_item" or d.get("ts_ms", 0) < cut: continue
+        items.append(d)
+        modes[d.get("mode","?")] = modes.get(d.get("mode","?"),0)+1
+        if d.get("degraded"): degraded[d["degraded"]] = degraded.get(d["degraded"],0)+1
+        for c in d.get("candidates") or []:
+            s = cand.setdefault(c.get("instance") or c.get("model","?"), {"ok":0,"fail":0,"lat":[]})
+            s["ok" if c.get("ok") else "fail"] += 1
+            if isinstance(c.get("latency_ms"), (int,float)): s["lat"].append(c["latency_ms"])
+        if isinstance(d.get("synthesis_ms"), (int,float)): synth.append(d["synthesis_ms"])
+        if isinstance(d.get("total_ms"), (int,float)): tot.append(d["total_ms"])
+print(f"MoA stats (last {hours:g}h): items={len(items)} by_mode={modes} degraded={degraded or 'none'}")
+for k, s in sorted(cand.items()):
+    print(f"  {k:<24} ok={s['ok']:<4} fail={s['fail']:<3} p50={pct(s['lat'],50):.0f}ms p95={pct(s['lat'],95):.0f}ms")
+if synth or tot:
+    print(f"  synthesis p50={pct(synth,50):.0f}ms p95={pct(synth,95):.0f}ms; item total p50={pct(tot,50):.0f}ms p95={pct(tot,95):.0f}ms")
+PY
+}
+
+CMD="${1:-status}"
+case "$CMD" in
+  status)
+    for i in $(instances); do
+      [ -n "${2:-}" ] && [ "$2" != "$i" ] && continue
+      echo "== $i (mode: $(inst_mode "$i"))"
+      curl -fsS -m 3 "http://127.0.0.1:$(inst_port "$i")/health" 2>/dev/null | python3 -m json.tool 2>/dev/null || \
+        echo "daemon: not reachable (run: moa diag $i)"
+    done
+    ;;
+  on) set_mode "${2:-claude}" moa ;;
+  off) set_mode "${2:-claude}" passthrough ;;
+  toggle)
+    inst="${2:-claude}"
+    if [ "$(inst_mode "$inst")" = "moa" ]; then set_mode "$inst" passthrough; else set_mode "$inst" moa; fi
+    ;;
+  logs)
+    tail -n "${2:-20}" "$(inst_log "${3:-claude}")" 2>/dev/null || echo "(no telemetry yet)"
+    ;;
+  errors)
+    grep -E '"degraded"|"client_error"|"error"|"aborted"' "$(inst_log "${3:-claude}")" 2>/dev/null | tail -n "${2:-20}" || echo "(no errors recorded)"
+    ;;
+  stats)
+    stats "${2:-24}"
+    ;;
+  diag)
+    diag "${2:-all}"
+    ;;
+  *)
+    sed -n '2,13p' "$0"; exit 64
+    ;;
+esac
